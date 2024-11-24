@@ -1,10 +1,15 @@
 name: "R2 to GitHub"
 description: "Transfer files from Cloudflare R2 to GitHub repositories based on size or quantity strategy."
+author: "jimugou"
 inputs:
   config_path:
-    description: "Path to the configuration YAML file"
+    description: "Path to the configuration YAML file."
     required: true
     default: "./config.yml"
+outputs:
+  result:
+    description: "Summary of the action's execution."
+
 runs:
   using: composite
   steps:
@@ -16,33 +21,35 @@ runs:
         # 读取配置文件内容并替换格式
         CONFIG=$(sed 's/[<>]//g; s/:/: /g; s/:[[:space:]]\+/: /g' "${{ inputs.config_path }}")
 
-        # 从配置文件中读取 Cloudflare R2 的相关参数
+        # 读取 R2 配置
         R2_ACCOUNT_NAME=($(yq '.r2_accounts[].name' <<< "$CONFIG"))
         R2_ACCOUNT_ID=($(yq '.r2_accounts[].account_id' <<< "$CONFIG"))
         R2_ACCESS_KEY_ID=($(yq '.r2_accounts[].access_key_id' <<< "$CONFIG"))
         R2_SECRET_ACCESS_KEY=($(yq '.r2_accounts[].secret_access_key' <<< "$CONFIG"))
         R2_BUCKET=($(yq '.r2_accounts[].bucket' <<< "$CONFIG"))
         R2_DIR=($(yq '.r2_accounts[].dir' <<< "$CONFIG"))
+        
+        # 生成 endpoint URLs
         for o in "${R2_ACCOUNT_ID[@]}"; do
           R2_ENDPOINT_URL+=(https://${o}.r2.cloudflarestorage.com)
         done
 
-        # 从配置文件中读取 GitHub 的相关参数
+        # 读取 GitHub 配置
         GITHUB_PAT=$(yq '.github_pat' <<< "$CONFIG")
         GITHUB_REPO_PREFIX=$(yq '.github_repo_prefix' <<< "$CONFIG")
         GITHUB_REPO_LIST=($(yq '.gitlab_pats | keys | .[]' <<< "$CONFIG" | sed "s/^/${GITHUB_REPO_PREFIX}&/g"))
         GITHUB_USERNAME=$(curl --silent --header "Authorization: Bearer $GITHUB_PAT" https://api.github.com/user | awk -F '"' '/"login":/{print $4}')
 
-        # 获取迁移策略
+        # 读取策略配置
         STRATEGY=$(yq '.strategy' <<< "$CONFIG")
         DELETE=$(yq '.delete' <<< "$CONFIG")
 
-        # 检查策略是否直接指定了仓库
+        # 检查策略是否指定仓库
         for j in ${GITHUB_REPO_LIST[@]}; do
           grep -qw "${STRATEGY}" <<< "$j" && REPO_NAME="${STRATEGY}" && break
         done
 
-        # 如果策略直接指定了仓库
+        # 确定目标仓库
         if [ -n "$REPO_NAME" ]; then
           STRATEGY_RESULT="策略: 指定存放到 ${REPO_NAME}"
         elif [ "${STRATEGY,,}" = 'quantity' ]; then
@@ -107,6 +114,7 @@ runs:
             [ -d "${REPO_NAME}" ] || git clone --depth=1 https://${GITHUB_USERNAME}:${GITHUB_PAT}@github.com/${GITHUB_USERNAME}/${REPO_NAME}.git
             cd ${REPO_NAME}
 
+            # 检查文件大小
             for k in "${FILE_LIST[@]}"; do
               FILE_SIZE=$(aws s3api head-object \
                   --endpoint-url="${R2_ENDPOINT_URL[n]}" \
@@ -114,14 +122,24 @@ runs:
                   --key "${k}" \
                   --query "ContentLength" \
                   --output text 2>/dev/null || echo "0")
-              [ "${FILE_SIZE}" -le 104857600 ] && NEED_MOVE_FILE+=(${k}) || SKIP_FILE+=(${k})
+              
+              if [ "$?" -eq 0 ] && [ "${FILE_SIZE}" -gt 0 ]; then
+                if [ "${FILE_SIZE}" -le 104857600 ]; then
+                  NEED_MOVE_FILE+=(${k})
+                else
+                  SKIP_FILE+=(${k})
+                fi
+              else
+                echo "警告: 无法获取文件 ${k} 的大小或文件不存在，跳过此文件"
+                continue
+              fi
             done
 
             [ "${#NEED_MOVE_FILE}" -gt 0 ] && echo "================================="
             for l in "${NEED_MOVE_FILE[@]}"; do
               (( m++ )) || true
               echo "${R2_ACCOUNT_NAME[n]} copying ${m} / ${#NEED_MOVE_FILE[@]} : ${l#*/}"
-              aws s3 cp --endpoint-url=${R2_ENDPOINT_URL[n]} s3://${R2_BUCKET[n]}/${l} ${l} >/dev/null
+              aws s3 cp --endpoint-url=${R2_ENDPOINT_URL[n]} s3://${R2_BUCKET[n]}/${l} ${l} >/dev/null || continue
               DELETE_FILE+=("${l}")
             done
 
