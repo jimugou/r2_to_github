@@ -114,34 +114,54 @@ runs:
             [ -d "${REPO_NAME}" ] || git clone --depth=1 https://${GITHUB_USERNAME}:${GITHUB_PAT}@github.com/${GITHUB_USERNAME}/${REPO_NAME}.git
             cd ${REPO_NAME}
 
+# ... 前面的代码保持不变，直到文件检查部分 ...
+
             # 检查文件大小
             for k in "${FILE_LIST[@]}"; do
-              FILE_SIZE=$(aws s3api head-object \
+              # 先检查文件是否存在
+              if aws s3api head-object \
                   --endpoint-url="${R2_ENDPOINT_URL[n]}" \
                   --bucket "${R2_BUCKET[n]}" \
-                  --key "${k}" \
-                  --query "ContentLength" \
-                  --output text 2>/dev/null || echo "0")
-              
-              if [ "$?" -eq 0 ] && [ "${FILE_SIZE}" -gt 0 ]; then
+                  --key "${k}" >/dev/null 2>&1; then
+                  
+                # 如果文件存在，获取文件大小
+                FILE_SIZE=$(aws s3api head-object \
+                    --endpoint-url="${R2_ENDPOINT_URL[n]}" \
+                    --bucket "${R2_BUCKET[n]}" \
+                    --key "${k}" \
+                    --query "ContentLength" \
+                    --output text)
+                
                 if [ "${FILE_SIZE}" -le 104857600 ]; then
                   NEED_MOVE_FILE+=(${k})
                 else
                   SKIP_FILE+=(${k})
                 fi
               else
-                echo "警告: 无法获取文件 ${k} 的大小或文件不存在，跳过此文件"
+                echo "警告: 文件 ${k} 不存在，跳过此文件"
                 continue
               fi
             done
 
-            [ "${#NEED_MOVE_FILE}" -gt 0 ] && echo "================================="
+            # 如果没有需要移动的文件，直接继续下一个账号
+            if [ "${#NEED_MOVE_FILE[@]}" -eq 0 ]; then
+              echo "没有找到可移动的文件，继续下一个账号"
+              continue
+            fi
+
+            echo "================================="
             for l in "${NEED_MOVE_FILE[@]}"; do
               (( m++ )) || true
               echo "${R2_ACCOUNT_NAME[n]} copying ${m} / ${#NEED_MOVE_FILE[@]} : ${l#*/}"
-              aws s3 cp --endpoint-url=${R2_ENDPOINT_URL[n]} s3://${R2_BUCKET[n]}/${l} ${l} >/dev/null || continue
-              DELETE_FILE+=("${l}")
+              if aws s3 cp --endpoint-url=${R2_ENDPOINT_URL[n]} s3://${R2_BUCKET[n]}/${l} ${l} >/dev/null 2>&1; then
+                DELETE_FILE+=("${l}")
+              else
+                echo "警告: 复制文件 ${l} 失败，跳过此文件"
+                continue
+              fi
             done
+
+# ... 后面的代码保持不变 ...
 
             git add .
             git commit -m "Add images from Cloudflare R2 ${R2_ACCOUNT_NAME[n]}" || echo "No changes to commit"
