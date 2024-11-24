@@ -18,27 +18,34 @@ runs:
       run: |
         echo "开始 R2 ---> GitHub 脚本"
 
+        # 安装 yq，如果未安装
+        if ! command -v yq &> /dev/null; then
+          echo "Installing yq..."
+          sudo apt-get update && sudo apt-get install -y yq
+        fi
+
         # 读取配置文件内容并替换格式，确保冒号后有空格
         CONFIG=$(sed 's/[<>]//g; s/:/: /g; s/:[[:space:]]\+/: /g' "${{ inputs.config_path }}")
 
         # 从配置文件中读取 Cloudflare R2 的相关参数
-        R2_ACCOUNT_NAME=($(yq '.r2_accounts[].name' <<< "$CONFIG")) # 获取所有 R2 的账户名称
-        R2_ACCOUNT_ID=($(yq '.r2_accounts[].account_id' <<< "$CONFIG")) # 获取所有 R2 的账户 ID
-        R2_ACCESS_KEY_ID=($(yq '.r2_accounts[].access_key_id' <<< "$CONFIG")) # 获取所有 R2 的访问密钥 ID
-        R2_SECRET_ACCESS_KEY=($(yq '.r2_accounts[].secret_access_key' <<< "$CONFIG")) # 获取所有 R2 的访问密钥
-        R2_BUCKET=($(yq '.r2_accounts[].bucket' <<< "$CONFIG")) # 获取所有 R2 的存储桶名称
-        R2_DIR=($(yq '.r2_accounts[].dir' <<< "$CONFIG")) # 获取所有 R2 的文件目录
-
+        readarray -t R2_ACCOUNT_NAME < <(yq '.r2_accounts[].name' <<< "$CONFIG")
+        readarray -t R2_ACCOUNT_ID < <(yq '.r2_accounts[].account_id' <<< "$CONFIG")
+        readarray -t R2_ACCESS_KEY_ID < <(yq '.r2_accounts[].access_key_id' <<< "$CONFIG")
+        readarray -t R2_SECRET_ACCESS_KEY < <(yq '.r2_accounts[].secret_access_key' <<< "$CONFIG")
+        readarray -t R2_BUCKET < <(yq '.r2_accounts[].bucket' <<< "$CONFIG")
+        readarray -t R2_DIR < <(yq '.r2_accounts[].dir' <<< "$CONFIG")
+        
         # 为每个账户生成对应的 endpoint URL
+        R2_ENDPOINT_URL=()
         for o in "${R2_ACCOUNT_ID[@]}"; do
-          R2_ENDPOINT_URL+=(https://${o}.r2.cloudflarestorage.com)
+          R2_ENDPOINT_URL+=("https://${o}.r2.cloudflarestorage.com")
         done
 
         # 从配置文件中读取 GitHub 的相关参数
         GITHUB_PAT=$(yq '.github_pat' <<< "$CONFIG")
         GITHUB_REPO_PREFIX=$(yq '.github_repo_prefix' <<< "$CONFIG")
         # 获取 GitHub 的仓库列表
-        GITHUB_REPO_LIST=($(yq '.gitlab_pats | keys | .[]' <<< "$CONFIG" | sed "s/^/${GITHUB_REPO_PREFIX}/g"))
+        readarray -t GITHUB_REPO_LIST < <(yq '.gitlab_pats | keys | .[]' <<< "$CONFIG" | sed "s/^/${GITHUB_REPO_PREFIX}/g")
         # 获取 GitHub 用户名
         GITHUB_USERNAME=$(curl --silent --header "Authorization: Bearer $GITHUB_PAT" https://api.github.com/user | awk -F '"' '/"login":/{print $4}')
 
@@ -49,8 +56,12 @@ runs:
         DELETE=$(yq '.delete' <<< "$CONFIG")
 
         # 检查策略是否直接指定了仓库
-        for j in ${GITHUB_REPO_LIST[@]}; do
-          grep -qw "${STRATEGY}" <<< "$j" && REPO_NAME="${STRATEGY}" && break
+        REPO_NAME=""
+        for j in "${GITHUB_REPO_LIST[@]}"; do
+          if grep -qw "${STRATEGY}" <<< "$j"; then
+            REPO_NAME="${STRATEGY}"
+            break
+          fi
         done
 
         # 如果策略直接指定了仓库
@@ -62,16 +73,16 @@ runs:
           MIN_FILE_QUANTITY=$(curl --silent \
           --header "Authorization: token ${GITHUB_PAT}" \
           --header "Accept: application/vnd.github.v3+json" \
-          https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[0]}/contents/${R2_DIR} | grep -c '"name"') # 获取第一个仓库的文件数量
+          "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[0]}/contents/${R2_DIR[0]}" | grep -c '"name"') # 获取第一个仓库的文件数量
 
           # 遍历仓库，找到文件数量最少的仓库
           for ((i=1; i<${#GITHUB_REPO_LIST[@]}; i++)); do
-            REPO_FILE_QUANTITY[i]=$(curl --silent \
+            REPO_FILE_QUANTITY=$(curl --silent \
             --header "Authorization: token ${GITHUB_PAT}" \
             --header "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[i]}/contents/${R2_DIR} | grep -c '"name"')
-            if [[ "$MIN_FILE_QUANTITY" -gt "${REPO_FILE_QUANTITY[i]}" ]]; then
-              MIN_FILE_QUANTITY="${REPO_FILE_QUANTITY[i]}"
+            "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[i]}/contents/${R2_DIR[i]}" | grep -c '"name"')
+            if [[ "$MIN_FILE_QUANTITY" -gt "$REPO_FILE_QUANTITY" ]]; then
+              MIN_FILE_QUANTITY="$REPO_FILE_QUANTITY"
               MIN_INDEX="$i"
             fi
           done
@@ -79,21 +90,25 @@ runs:
           STRATEGY_RESULT="策略: 存放到文件数量最少的 ${REPO_NAME}" # 选择文件数量最少的仓库
         else
           # 如果策略是基于仓库大小的最小策略
-          grep -qwE 'size|quantity' <<< "${STRATEGY,,}" || echo "Strategy 现在 [${STRATEGY}] 不可用， 将采用默认策略 size，可选项是 [size|quantity|$(sed 's/ /|/g' <<< "${GITHUB_REPO_LIST[@]}")]"
+          if ! grep -qwE 'size|quantity' <<< "${STRATEGY,,}"; then
+            echo "Strategy 现在 [${STRATEGY}] 不可用， 将采用默认策略 size，可选项是 [size|quantity|$(IFS='|' ; echo "${GITHUB_REPO_LIST[*]}")]"
+            STRATEGY_RESULT="策略: 采用默认策略 size"
+            STRATEGY="size"
+          fi
           MIN_INDEX=0
           MIN_REPO_SIZE=$(curl --silent \
           --header "Authorization: token ${GITHUB_PAT}" \
           --header "Accept: application/vnd.github.v3+json" \
-          https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[0]}/contents/${R2_DIR} | awk -F '[:,]' '/"size":/{print $2}' | awk '{s+=$1} END {print s}') # 获取第一个仓库的大小
+          "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[0]}/contents/${R2_DIR[0]}" | awk -F '[:,]' '/"size":/{print $2}' | awk '{s+=$1} END {print s}') # 获取第一个仓库的大小
 
           # 遍历仓库，找到容量最小的仓库
           for ((i=1; i<${#GITHUB_REPO_LIST[@]}; i++)); do
-            REPO_SIZE[i]=$(curl --silent \
+            REPO_SIZE=$(curl --silent \
             --header "Authorization: token ${GITHUB_PAT}" \
             --header "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[i]}/contents/${R2_DIR} | awk -F '[:,]' '/"size":/{print $2}' | awk '{s+=$1} END {print s}')
-            if [[ "$MIN_REPO_SIZE" -gt "${REPO_SIZE[i]}" ]]; then
-              MIN_REPO_SIZE="${REPO_SIZE[i]}"
+            "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_LIST[i]}/contents/${R2_DIR[i]}" | awk -F '[:,]' '/"size":/{print $2}' | awk '{s+=$1} END {print s}')
+            if [[ "$MIN_REPO_SIZE" -gt "$REPO_SIZE" ]]; then
+              MIN_REPO_SIZE="$REPO_SIZE"
               MIN_INDEX="$i"
             fi
           done
@@ -101,13 +116,13 @@ runs:
           STRATEGY_RESULT="策略: 存放到仓库容量最少的 ${REPO_NAME}" # 选择容量最小的仓库
         fi
 
-        # 提交更改到 GitHub
-        git config --global user.name 'github-actions' # 设置 Git 用户名
-        git config --global user.email 'github-actions@github.com' # 设置 Git 用户邮箱
+        # 配置 Git
+        git config --global user.name 'github-actions'
+        git config --global user.email 'github-actions@github.com'
 
         # 配置 AWS CLI 访问 Cloudflare R2 的凭据
-        aws configure set region auto # 配置默认区域
-        aws configure set output json # 设置输出格式为 JSON
+        aws configure set region auto
+        aws configure set output json
 
         REPORT="" # 初始化报告
 
@@ -120,7 +135,7 @@ runs:
 
           # 获取 Cloudflare R2 中的所有文件列表
           unset FILE_LIST SUCCESS_UPDATE NEED_MOVE_FILE SKIP_FILE DELETE_FILE m
-          FILE_LIST=($(aws s3 ls --endpoint-url="${R2_ENDPOINT_URL[n]}" s3://${R2_BUCKET[n]}/ --recursive | awk '{print $NF}'))
+          readarray -t FILE_LIST < <(aws s3 ls --endpoint-url="${R2_ENDPOINT_URL[n]}" "s3://${R2_BUCKET[n]}/" --recursive | awk '{ $1=$2=$3=$4=""; print substr($0,5) }')
 
           # 如果有文件需要处理
           if [ "${#FILE_LIST[@]}" -gt 0 ]; then
@@ -132,19 +147,25 @@ runs:
 
             # 遍历文件列表，检查每个文件的大小
             for k in "${FILE_LIST[@]}"; do
-              FILE_SIZE=$(aws s3api head-object \
+              if aws s3api head-object \
                   --endpoint-url="${R2_ENDPOINT_URL[n]}" \
                   --bucket "${R2_BUCKET[n]}" \
-                  --key "${k}" \
-                  --query "ContentLength" \
-                  --output text 2>/dev/null || echo "0")
+                  --key "${k}" >/dev/null 2>&1; then
 
-              if [ "${FILE_SIZE}" -le 104857600 ] && [ "${FILE_SIZE}" -ne "0" ]; then
-                NEED_MOVE_FILE+=("${k}")
-              elif [ "${FILE_SIZE}" -gt 104857600 ]; then
-                SKIP_FILE+=("${k}")
+                FILE_SIZE=$(aws s3api head-object \
+                    --endpoint-url="${R2_ENDPOINT_URL[n]}" \
+                    --bucket "${R2_BUCKET[n]}" \
+                    --key "${k}" \
+                    --query "ContentLength" \
+                    --output text 2>/dev/null || echo "0")
+
+                if [ "${FILE_SIZE}" -le 104857600 ] && [ "${FILE_SIZE}" -ne "0" ]; then
+                  NEED_MOVE_FILE+=("${k}")
+                elif [ "${FILE_SIZE}" -gt 104857600 ]; then
+                  SKIP_FILE+=("${k}")
+                fi
               else
-                echo "警告: 文件 ${k} 不存在或无法访问，跳过此文件"
+                echo "警告: 文件 \"${k}\" 不存在或无法访问，跳过此文件"
                 continue
               fi
             done
@@ -155,11 +176,11 @@ runs:
               m=0
               for l in "${NEED_MOVE_FILE[@]}"; do
                 (( m++ ))
-                echo "${R2_ACCOUNT_NAME[n]} copying ${m} / ${#NEED_MOVE_FILE[@]} : ${l#*/}"
+                echo "${R2_ACCOUNT_NAME[n]} copying ${m} / ${#NEED_MOVE_FILE[@]} : ${l}"
                 if aws s3 cp --endpoint-url="${R2_ENDPOINT_URL[n]}" "s3://${R2_BUCKET[n]}/${l}" "${l}" >/dev/null 2>&1; then
                   DELETE_FILE+=("${l}")
                 else
-                  echo "警告: 复制文件 ${l} 失败，跳过此文件"
+                  echo "警告: 复制文件 \"${l}\" 失败，跳过此文件"
                   continue
                 fi
               done
@@ -180,7 +201,7 @@ runs:
                   if aws s3 rm --endpoint-url="${R2_ENDPOINT_URL[n]}" "s3://${R2_BUCKET[n]}/${file}" >/dev/null 2>&1; then
                     echo "已删除文件: ${file}"
                   else
-                    echo "警告: 无法删除文件 ${file}"
+                    echo "警告: 无法删除文件 \"${file}\""
                   fi
                 done
               else
@@ -191,9 +212,9 @@ runs:
               REPORT+="\n已成功${COPY_OR_MOVE} CloudFlare R2 ${R2_ACCOUNT_NAME[n]} ${#NEED_MOVE_FILE[@]} 个文件 ---> ${REPO_NAME}"
               if [ "${#SKIP_FILE[@]}" -gt 0 ]; then
                 if [ "${#SKIP_FILE[@]}" -eq 1 ]; then
-                  REPORT+="\n1 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，是 ${SKIP_FILE[@]}"
+                  REPORT+="\n1 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，是 \"${SKIP_FILE[@]}\""
                 else
-                  REPORT+="\n${#SKIP_FILE[@]} 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，分别是 ${SKIP_FILE[@]}"
+                  REPORT+="\n${#SKIP_FILE[@]} 个文件大于 100MB，不能${COPY_OR_MOVE}到 ${REPO_NAME}，分别是 \"${SKIP_FILE[@]}\""
                 fi
               fi
             else
